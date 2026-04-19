@@ -156,14 +156,17 @@ mod tests {
     }
 
     fn build_test_query(domain: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push(0xab); buf.push(0xcd); // txid
-        buf.push(0x01); buf.push(0x00); // flags
-        buf.push(0x00); buf.push(0x01); // qdcount
-        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let mut buf = vec![
+            0xab, 0xcd, // txid
+            0x01, 0x00, // flags
+            0x00, 0x01, // qdcount
+            0, 0, 0, 0, 0, 0, // an/ns/ar counts
+        ];
         buf.extend_from_slice(&encode_dns_name(domain));
-        buf.push(0x00); buf.push(0x01); // type A
-        buf.push(0x00); buf.push(0x01); // class IN
+        buf.extend_from_slice(&[
+            0x00, 0x01, // type A
+            0x00, 0x01, // class IN
+        ]);
         buf
     }
 

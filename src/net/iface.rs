@@ -8,12 +8,10 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct IfaceInfo {
-    pub name: String,
     pub mac: [u8; 6],
     pub ip: Ipv4Addr,
     pub netmask: Ipv4Addr,
     pub gateway_ip: Ipv4Addr,
-    pub gateway_mac: Option<[u8; 6]>,
     pub iface: NetworkInterface,
 }
 
@@ -120,15 +118,12 @@ pub fn get_iface_info(name: &str) -> Result<IfaceInfo> {
     let netmask = Ipv4Addr::from(mask_bits);
 
     let gateway_ip = detect_gateway(name)?;
-    let gateway_mac = lookup_arp_cache(gateway_ip);
 
     Ok(IfaceInfo {
-        name: name.to_string(),
         mac,
         ip,
         netmask,
         gateway_ip,
-        gateway_mac,
         iface,
     })
 }

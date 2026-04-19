@@ -74,6 +74,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 theme::text_normal()
             },
         ),
+        Span::styled("  ", theme::text_dim()),
+        Span::styled(
+            if app.responder_active {
+                "responder: ON"
+            } else {
+                "responder: off"
+            },
+            if app.responder_active {
+                theme::success_style()
+            } else {
+                theme::text_dim()
+            },
+        ),
     ])];
 
     let block = Block::default()
@@ -125,9 +138,11 @@ fn draw_hosts(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, host)| {
             let poison = app.poisons.iter().find(|p| p.target_ip == host.ip);
+            let excluded = poison.is_none() && app.is_excluded(host.ip, host.mac);
             let status = match poison {
                 Some(p) if p.kill_mode => "killed",
                 Some(_) => "poisoned",
+                None if excluded => "excluded",
                 None if host.ip == app.gateway_ip => "gateway",
                 None => "",
             };
@@ -136,11 +151,14 @@ fn draw_hosts(frame: &mut Frame, app: &App, area: Rect) {
                 "killed" => theme::kill_style(),
                 "poisoned" => theme::success_style(),
                 "gateway" => theme::header_style(),
+                "excluded" => theme::text_dim(),
                 _ => theme::text_dim(),
             };
 
             let row_style = if i == app.host_scroll {
                 theme::selected_style()
+            } else if excluded {
+                theme::text_dim()
             } else {
                 theme::text_normal()
             };
@@ -244,6 +262,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" dns  ", theme::text_dim()),
             Span::styled("c", theme::cred_style()),
             Span::styled(" cure  ", theme::text_dim()),
+            Span::styled("r", theme::cred_style()),
+            Span::styled(" responder  ", theme::text_dim()),
+            Span::styled("e", theme::cred_style()),
+            Span::styled(" export  ", theme::text_dim()),
             Span::styled("  |  ", theme::text_dim()),
             Span::styled(&app.status_message, theme::text_normal()),
         ])],

@@ -370,12 +370,10 @@ mod tests {
         );
 
         let info = IfaceInfo {
-            name: "eth0".into(),
             mac: our_mac,
             ip: Ipv4Addr::new(192, 168, 1, 100),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
             gateway_ip: Ipv4Addr::new(192, 168, 1, 1),
-            gateway_mac: None,
             iface: pnet_datalink::interfaces()[0].clone(),
         };
 
@@ -398,12 +396,10 @@ mod tests {
         );
 
         let info = IfaceInfo {
-            name: "eth0".into(),
             mac: our_mac,
             ip: Ipv4Addr::new(192, 168, 1, 100),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
             gateway_ip: Ipv4Addr::new(192, 168, 1, 1),
-            gateway_mac: None,
             iface: pnet_datalink::interfaces()[0].clone(),
         };
 
@@ -425,12 +421,10 @@ mod tests {
         );
 
         let info = IfaceInfo {
-            name: "eth0".into(),
             mac: our_mac,
             ip: Ipv4Addr::new(192, 168, 1, 100),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
             gateway_ip: Ipv4Addr::new(192, 168, 1, 1),
-            gateway_mac: None,
             iface: pnet_datalink::interfaces()[0].clone(),
         };
 

